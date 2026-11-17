@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Event Stream to MIDI & MP3 Studio</title>
+    <!-- Libreria leggera per codifica MP3 direttamente nel browser -->
+    <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 850px; margin: 30px auto; padding: 20px; background: #f0f2f5; color: #333; }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); }
+        h2 { margin-top: 0; color: #1a73e8; }
+        label { font-weight: 600; font-size: 14px; display: block; margin-bottom: 8px; }
+        textarea { width: 100%; height: 180px; padding: 12px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-family: monospace; font-size: 13px; resize: vertical; background: #f8f9fa; }
+        .btn-group { display: flex; gap: 15px; margin-top: 20px; flex-wrap: wrap; }
+        button { border: none; padding: 12px 22px; border-radius: 6px; cursor: pointer; font-size: 15px; font-weight: bold; color: white; transition: transform 0.1s, opacity 0.2s; }
+        button:active { transform: scale(0.98); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-midi { background: #0066ff; }
+        .btn-midi:hover { background: #0052cc; }
+        .btn-mp3 { background: #28a745; }
+        .btn-mp3:hover { background: #218838; }
+        .status { margin-top: 15px; font-size: 14px; font-weight: 600; color: #555; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>🎹 Convertitore Event Stream &rarr; MIDI / MP3</h2>
+    <label for="eventInput">Incolla la stringa di eventi (NOTE_ON, NOTE_OFF, TIME):</label>
+    <textarea id="eventInput" placeholder="Es. NOTE_ON:60:80 TIME:200 NOTE_ON:64:80 NOTE_ON:67:80 TIME:600 NOTE_OFF:60:0 NOTE_OFF:64:0 NOTE_OFF:67:0">NOTE_ON:60:80 TIME:200 NOTE_ON:60:90 NOTE_ON:64:90 NOTE_ON:67:90 TIME:600 NOTE_OFF:60:0 NOTE_OFF:64:0 NOTE_OFF:67:0</textarea>
+
+    <div class="btn-group">
+        <button class="btn-midi" onclick="scaricaMidi()">💾 Download MIDI (mido)</button>
+        <button class="btn-mp3" id="btnMp3" onclick="scaricaMp3()">🎵 Download MP3</button>
+    </div>
+
+    <div id="statusMsg" class="status">Pronto.</div>
+</div>
+
+<script>
+    // ==========================================
+    // 1. PARSER COMUNE DEL FLUSSO DI EVENTI
+    // ==========================================
+    function parseEventStream(rawString) {
+        const tokens = rawString.trim().split(/\s+/);
+        const eventi = [];
+        let tempoCorrenteMs = 0;
+
+        for (let token of tokens) {
+            if (token.startsWith("NOTE_ON:")) {
+                const [, notaStr, velStr] = token.split(":");
+                eventi.push({
+                    tipo: "on",
+                    nota: parseInt(notaStr, 10),
+                    velocity: parseInt(velStr ?? 64, 10),
+                    tempoMs: tempoCorrenteMs
+                });
+            } else if (token.startsWith("NOTE_OFF:")) {
+                const [, notaStr, velStr] = token.split(":");
+                eventi.push({
+                    tipo: "off",
+                    nota: parseInt(notaStr, 10),
+                    velocity: parseInt(velStr ?? 0, 10),
+                    tempoMs: tempoCorrenteMs
+                });
+            } else if (token.startsWith("TIME:")) {
+                const ms = parseInt(token.replace("TIME:", ""), 10);
+                if (!isNaN(ms)) tempoCorrenteMs += ms;
+            }
+        }
+        return { eventi, durataTotaleMs: tempoCorrenteMs };
+    }
+
+    function aggiornaStato(testo) {
+        document.getElementById("statusMsg").textContent = testo;
+    }
+
+    function forzaDownload(blob, nomeFile) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = nomeFile;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    // ==========================================
+    // 2. GENERATORE BINARIO MIDI (.MID) PURO
+    // ==========================================
+    function encodeVariableLength(value) {
+        let buffer = [value & 0x7F];
+        while ((value >>= 7) > 0) {
+            buffer.unshift((value & 0x7F) | 0x80);
+        }
+        return buffer;
+    }
+
+    function scaricaMidi() {
+        const testo = document.getElementById("eventInput").value;
+        const { eventi } = parseEventStream(testo);
+
+        if (eventi.length === 0) {
+            return aggiornaStato("⚠️ Inserisci una stringa di eventi valida prima di scaricare.");
+        }
+
+        aggiornaStato("⚙️ Costruzione file MIDI binario in corso...");
+
+        // Conversione ms -> ticks (480 ticks per beat @ 120 BPM = 500ms per beat)
+        const msToTicks = (ms) => Math.round((ms / 500.0) * 480);
+
+        let trackBytes = [];
+        let ultimoTempoMs = 0;
+
+        for (let ev of eventi) {
+            const deltaMs = ev.tempoMs - ultimoTempoMs;
+            const deltaTicks = msToTicks(deltaMs);
+            ultimoTempoMs = ev.tempoMs;
+
+            trackBytes.push(...encodeVariableLength(deltaTicks));
+
+            if (ev.tipo === "on") {
+                trackBytes.push(0x90, ev.nota & 0x7F, ev.velocity & 0x7F);
+            } else if (ev.tipo === "off") {
+                trackBytes.push(0x80, ev.nota & 0x7F, ev.velocity & 0x7F);
+            }
+        }
+
+        // End of Track Meta-Event (00 FF 2F 00)
+        trackBytes.push(0x00, 0xFF, 0x2F, 0x00);
+
+        // Header Chunk: MThd (6 bytes: format 0, 1 track, 480 ticks/quarter)
+        const header = [
+            0x4D, 0x54, 0x68, 0x64, // "MThd"
+            0x00, 0x00, 0x00, 0x06, // lunghezza header = 6
+            0x00, 0x00,             // formato 0
+            0x00, 0x01,             // 1 traccia
+            0x01, 0xE0              // 480 ticks per beat (0x01E0)
+        ];
+
+        // Track Chunk Header: MTrk + lunghezza trackBytes (4 bytes big-endian)
+        const len = trackBytes.length;
+        const trackHeader = [
+            0x4D, 0x54, 0x72, 0x6B, // "MTrk"
+            (len >> 24) & 0xFF,
+            (len >> 16) & 0xFF,
+            (len >> 8) & 0xFF,
+            len & 0xFF
+        ];
+
+        const midiBytes = new Uint8Array([...header, ...trackHeader, ...trackBytes]);
+        const blob = new Blob([midiBytes], { type: "audio/midi" });
+        
+        forzaDownload(blob, "composizione_mido.mid");
+        aggiornaStato("✅ File MIDI (.mid) scaricato!");
+    }
+
+    // ==========================================
+    // 3. SINTESI POLIFONICA OFFLINE + EXPORT MP3
+    // ==========================================
+    function midiToFreq(nota) {
+        return 440 * Math.pow(2, (nota - 69) / 12);
+    }
+
+    async function scaricaMp3() {
+        const testo = document.getElementById("eventInput").value;
+        const { eventi, durataTotaleMs } = parseEventStream(testo);
+
+        if (eventi.length === 0) {
+            return aggiornaStato("⚠️ Inserisci una stringa di eventi valida prima di scaricare.");
+        }
+
+        const btnMp3 = document.getElementById("btnMp3");
+        btnMp3.disabled = true;
+        aggiornaStato("🎹 Sintesi audio polifonica in corso...");
+
+        try {
+            const sampleRate = 44100;
+            // Aggiungiamo 0.8s di coda per il release naturale del suono
+            const durataSec = (durataTotaleMs / 1000) + 0.8;
+            const offlineCtx = new OfflineAudioContext(1, Math.ceil(sampleRate * durataSec), sampleRate);
+
+            // Raggruppiamo note_on e note_off corrispondenti per ciascuna nota MIDI
+            const noteAttive = {}; // nota -> array di { startSec, velocity }
+
+            for (let ev of eventi) {
+                const sec = ev.tempoMs / 1000;
+                if (ev.tipo === "on" && ev.velocity > 0) {
+                    if (!noteAttive[ev.nota]) noteAttive[ev.nota] = [];
+                    noteAttive[ev.nota].push({ startSec: sec, velocity: ev.velocity });
+                } else {
+                    // Spegnimento (NOTE_OFF o NOTE_ON con vel 0)
+                    if (noteAttive[ev.nota] && noteAttive[ev.nota].length > 0) {
+                        const notaObj = noteAttive[ev.nota].shift();
+                        schedulaNotaSintetizzata(offlineCtx, ev.nota, notaObj.startSec, sec, notaObj.velocity);
+                    }
+                }
+            }
+
+            // Chiudi eventuali note rimaste aperte alla fine
+            for (let notaStr in noteAttive) {
+                const nota = parseInt(notaStr, 10);
+                for (let notaObj of noteAttive[nota]) {
+                    schedulaNotaSintetizzata(offlineCtx, nota, notaObj.startSec, durataTotaleMs / 1000, notaObj.velocity);
+                }
+            }
+
+            const renderedBuffer = await offlineCtx.startRendering();
+            aggiornaStato("🎧 Codifica MP3 in corso...");
+
+            // Conversione Float32 -> Int16 PCM per lamejs
+            const floatSamples = renderedBuffer.getChannelData(0);
+            const pcmSamples = new Int16Array(floatSamples.length);
+            for (let i = 0; i < floatSamples.length; i++) {
+                let s = Math.max(-1, Math.min(1, floatSamples[i]));
+                pcmSamples[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+
+            const mp3encoder = new lamejs.Mp3Encoder(1, sampleRate, 128);
+            const mp3Data = [];
+            const blockSize = 1152;
+
+            for (let i = 0; i < pcmSamples.length; i += blockSize) {
+                const chunk = pcmSamples.subarray(i, i + blockSize);
+                const mp3buf = mp3encoder.encodeBuffer(chunk);
+                if (mp3buf.length > 0) mp3Data.push(mp3buf);
+            }
+            const endBuf = mp3encoder.flush();
+            if (endBuf.length > 0) mp3Data.push(endBuf);
+
+            const blob = new Blob(mp3Data, { type: "audio/mp3" });
+            forzaDownload(blob, "composizione.mp3");
+            aggiornaStato("✅ File MP3 scaricato!");
+        } catch (err) {
+            console.error(err);
+            aggiornaStato("❌ Errore durante la generazione MP3.");
+        } finally {
+            btnMp3.disabled = false;
+        }
+    }
+
+    // Sintetizzatore polifonico stile piano elettrico (Triangolo + Armonica + ADSR)
+    function schedulaNotaSintetizzata(ctx, notaMidi, startTime, endTime, velocity) {
+        const freq = midiToFreq(notaMidi);
+        const amp = (velocity / 127) * 0.25; // Volume proporzionale alla velocity, bilanciato per polifonia
+        const stopTime = Math.max(endTime, startTime + 0.05);
+
+        const osc1 = ctx.createOscillator();
+        const osc2 = ctx.createOscillator();
+        const gainNode = ctx.createGain();
+
+        osc1.type = "triangle";
+        osc1.frequency.setValueAtTime(freq, startTime);
+
+        osc2.type = "sine";
+        osc2.frequency.setValueAtTime(freq * 2, startTime); // Ottava superiore morbida
+
+        const subGain = ctx.createGain();
+        subGain.gain.setValueAtTime(0.25, startTime);
+        osc2.connect(subGain);
+
+        osc1.connect(gainNode);
+        subGain.connect(gainNode);
+        gainNode.connect(ctx.destination);
+
+        // Inviluppo ADSR morbido per evitare click
+        gainNode.gain.setValueAtTime(0.0001, startTime);
+        gainNode.gain.linearRampToValueAtTime(amp, startTime + 0.015);
+        gainNode.gain.exponentialRampToValueAtTime(amp * 0.7, stopTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.0001, stopTime + 0.25);
+
+        osc1.start(startTime);
+        osc2.start(startTime);
+        osc1.stop(stopTime + 0.26);
+        osc2.stop(stopTime + 0.26);
+    }
+</script>
+
+</body>
+</html>
